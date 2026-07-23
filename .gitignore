@@ -1,0 +1,9 @@
+node_modules/
+.npm/
+npm-debug.log
+.env
+connection/session/
+*.tar.gz
+*.tmp
+*.bak
+output_*
