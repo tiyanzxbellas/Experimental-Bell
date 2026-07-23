@@ -10,6 +10,7 @@
       ▪︎ https://xterm.tech
   */
 /*!-======[ Preparing Configuration ]======-!*/
+import 'dotenv/config';
 import './toolkit/set/prototype.js';
 let { initialize } = await './toolkit/set/global.js'.r();
 
