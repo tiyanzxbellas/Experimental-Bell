@@ -95,7 +95,16 @@ export function loadAllSkills() {
 // Load skills immediately
 loadAllSkills();
 
-export default async function on({ Exp, ev, store, cht, ai, is }) {
+/**
+ * Runs the autonomous Bella AI workflow agent to solve tasks using available tools.
+ * @param {Object} params
+ * @param {Object} params.Exp - The WA Client / Exp object
+ * @param {Object} params.cht - The chat event object
+ * @param {string} [params.skillName] - The name of the registered skill to load instructions from (optional)
+ * @param {string} params.userInput - The natural language request or parameters from the user
+ * @param {Object} params.ev - The event emitter/listener object
+ */
+export async function runWorkflowAgent({ Exp, cht, skillName, userInput, ev }) {
   let { sender, id } = cht;
   const { func } = Exp;
   const user = sender.split('@')[0];
@@ -103,6 +112,294 @@ export default async function on({ Exp, ev, store, cht, ai, is }) {
 
   // Load reasoner dynamically
   const { ai: runAiReasoner } = await `${fol[2]}reasoner.js`.r();
+
+  // Create user VFS directory if it doesn't exist
+  if (!fs.existsSync(userVfsDir)) {
+    fs.mkdirSync(userVfsDir, { recursive: true });
+  }
+
+  const _key = keys[sender];
+
+  // Load skills map if empty
+  if (Object.keys(Data.skills || {}).length === 0) {
+    loadAllSkills();
+  }
+
+  let stepHistory = '';
+  let displayName = 'E2B Agent';
+  if (skillName && Data.skills[skillName]) {
+    const skill = Data.skills[skillName];
+    displayName = skill.name;
+    stepHistory = `--- WORKFLOW INSTRUCTIONS ---\n${skill.instructions}\n\n--- USER INPUT ---\n${userInput}\n\n`;
+    await cht.edit(`🤖 *[ Workflow Engine ]*\n\nMemulai eksekusi skill: *${skill.name}*...\n\n_Membaca instruksi & menyiapkan environment..._`, _key, true);
+  } else {
+    stepHistory = `--- USER INSTRUCTION ---\n${userInput}\n\n`;
+    await cht.edit(`🤖 *[ E2B Agent Engine ]*\n\nMemulai tugas E2B: *${userInput.slice(0, 50)}...*\n\n_Menyiapkan environment & menginisialisasi Bella Agent..._`, _key, true);
+  }
+
+  let currentIteration = 1;
+  const maxIterations = 8;
+  let workflowFinished = false;
+
+  // Define available tools
+  const tools = [
+    {
+      description: "Melihat daftar file di Virtual File System (VFS) user.",
+      output: { cmd: "vfs_ls" }
+    },
+    {
+      description: "Membaca isi file di VFS user.",
+      output: { cmd: "vfs_read", cfg: { filename: "nama_file.txt" } }
+    },
+    {
+      description: "Menulis atau memperbarui file di VFS user.",
+      output: { cmd: "vfs_write", cfg: { filename: "nama_file.txt", content: "isi konten file" } }
+    },
+    {
+      description: "Menjalankan kode Python di secure E2B Sandbox. Secara otomatis mengunggah seluruh isi VFS Anda ke sandbox sebelum eksekusi, serta mengunduh seluruh file baru/grafik yang dibuat kembali ke VFS Anda.",
+      output: { cmd: "e2b_run", cfg: { code: "import pandas as pd\n..." } }
+    },
+    {
+      description: "Melakukan pencarian informasi real-time di web.",
+      output: { cmd: "web_search", cfg: { query: "query pencarian" } }
+    },
+    {
+      description: "Kalkulator untuk menghitung ekspresi matematika secara aman.",
+      output: { cmd: "calc", cfg: { expression: "2 * (5 + 3)" } }
+    },
+    {
+      description: "Membuat atau memperbarui skill workflow Markdown baru di toolkit/db/skills/.",
+      output: { cmd: "write_skill", cfg: { name: "nama_skill", content: "isi markdown skill lengkap dengan # Skill: nama, ## Description, ## Instructions" } }
+    },
+    {
+      description: "Menghapus skill workflow dari toolkit/db/skills/.",
+      output: { cmd: "delete_skill", cfg: { name: "nama_skill" } }
+    },
+    {
+      description: "Melihat daftar seluruh skill workflow yang terdaftar di sistem.",
+      output: { cmd: "list_skills" }
+    },
+    {
+      description: "Menyelesaikan workflow dan memberikan hasil akhir/rangkuman lengkap kepada user.",
+      output: { cmd: "workflow_complete", msg: "Rangkuman lengkap dan hasil akhir workflow Anda." }
+    }
+  ];
+
+  const systemProfile = `Anda adalah asisten AI otonom yang sangat terampil bernama Bella.
+Tugas Anda adalah memandu dan menyelesaikan workflow atau instruksi permintaan berikut menggunakan tools yang tersedia.
+Ikuti instruksi langkah-demi-langkah dengan sangat teliti.
+
+Anda dapat menggunakan tools seperti VFS, E2B Sandbox (untuk menjalankan Python), Web Search, Kalkulator, dan Skill Management.
+Gunakan tools tersebut secara berurutan dan otonom. Jangan menjelaskan tool call kepada user, cukup panggil tool-nya.
+Setelah selesai melaksanakan seluruh instruksi atau mencapai tujuan, panggil tool 'workflow_complete' dengan rangkuman hasil.
+
+Informasi User ID Anda: ${user}
+Lakukan langkah demi langkah.`;
+
+  while (currentIteration <= maxIterations && !workflowFinished) {
+    await cht.edit(`🤖 *[ Workflow: ${displayName} ]*\n\n[Langkah ${currentIteration}/${maxIterations}] AI sedang berpikir dan menganalisis langkah selanjutnya...`, _key, true);
+
+    // Fetch user VFS file list to give context to the AI
+    const vfsFiles = fs.existsSync(userVfsDir) ? fs.readdirSync(userVfsDir) : [];
+    const vfsContext = vfsFiles.length > 0 ? `File saat ini di VFS: ${vfsFiles.join(', ')}` : 'VFS saat ini kosong.';
+
+    const promptText = `Status Iterasi Saat Ini: ${currentIteration}
+${vfsContext}
+
+Riwayat Langkah Sebelumnya & Hasil Eksekusi:
+${stepHistory}
+
+Silakan analisis instruksi dan putuskan tindakan berikutnya. Panggil tool yang sesuai. Jika sudah selesai, panggil 'workflow_complete'.`;
+
+    try {
+      const aiResponse = await runAiReasoner({
+        text: promptText,
+        id: sender,
+        fullainame: botfullname,
+        nickainame: botnickname,
+        senderName: cht.pushName,
+        ownerName: ownername,
+        date: func.newDate(),
+        role: 'Asisten AI Alur Kerja',
+        msgtype: 'text',
+        custom_profile: systemProfile,
+        commands: tools
+      });
+
+      const config = aiResponse?.data || {};
+      console.log(`[Workflow Agent Step ${currentIteration}]`, config);
+
+      if (!config.cmd) {
+        // Default text output from AI, record it and ask again if not finished
+        const msg = config.msg || aiResponse?.response || 'Memikirkan langkah berikutnya...';
+        stepHistory += `\nThought: ${msg}\n`;
+        currentIteration++;
+        continue;
+      }
+
+      // Handle 'vfs_ls'
+      if (config.cmd === 'vfs_ls') {
+        const files = fs.existsSync(userVfsDir) ? fs.readdirSync(userVfsDir) : [];
+        const result = files.length > 0 ? `Daftar file: ${files.join(', ')}` : 'VFS kosong.';
+        stepHistory += `\nAction: vfs_ls\nResult: ${result}\n`;
+        await cht.edit(`🤖 *[ Workflow ]*\nTool Call: \`vfs_ls\`\nResult: ${result}`, _key, true);
+      }
+      // Handle 'vfs_read'
+      else if (config.cmd === 'vfs_read') {
+        const filename = config.cfg?.filename;
+        if (!filename) {
+          stepHistory += `\nAction: vfs_read\nResult: Gagal - filename tidak disediakan.\n`;
+        } else {
+          const safeName = path.basename(filename);
+          const filePath = path.join(userVfsDir, safeName);
+          if (fs.existsSync(filePath)) {
+            const content = fs.readFileSync(filePath, 'utf8');
+            stepHistory += `\nAction: vfs_read(${safeName})\nResult: \`\`\`\n${content}\n\`\`\`\n`;
+            await cht.edit(`🤖 *[ Workflow ]*\nTool Call: \`vfs_read\` untuk file *${safeName}*`, _key, true);
+          } else {
+            stepHistory += `\nAction: vfs_read(${safeName})\nResult: Gagal - file tidak ditemukan.\n`;
+          }
+        }
+      }
+      // Handle 'vfs_write'
+      else if (config.cmd === 'vfs_write') {
+        const filename = config.cfg?.filename;
+        const content = config.cfg?.content;
+        if (!filename || !content) {
+          stepHistory += `\nAction: vfs_write\nResult: Gagal - filename atau content tidak disediakan.\n`;
+        } else {
+          const safeName = path.basename(filename);
+          const filePath = path.join(userVfsDir, safeName);
+          fs.writeFileSync(filePath, content, 'utf8');
+          stepHistory += `\nAction: vfs_write(${safeName})\nResult: Sukses menulis file.\n`;
+          await cht.edit(`🤖 *[ Workflow ]*\nTool Call: \`vfs_write\` menulis ke file *${safeName}*`, _key, true);
+        }
+      }
+      // Handle 'e2b_run'
+      else if (config.cmd === 'e2b_run') {
+        const code = config.cfg?.code;
+        if (!code) {
+          stepHistory += `\nAction: e2b_run\nResult: Gagal - code tidak disediakan.\n`;
+        } else {
+          await cht.edit(`🤖 *[ Workflow ]*\nTool Call: \`e2b_run\` - Menjalankan kode Python di E2B Sandbox...`, _key, true);
+          const runResult = await runCodeInSandbox({ code, language: 'python', userId: user });
+
+          let runOutput = '';
+          if (runResult.success) {
+            runOutput = `stdout:\n${runResult.stdout}\nstderr:\n${runResult.stderr}`;
+            if (runResult.files && runResult.files.length > 0) {
+              runOutput += `\nFile baru dihasilkan: ${runResult.files.map(f => f.filename).join(', ')}`;
+              // Instantly send generated plots/images to the user!
+              for (const f of runResult.files) {
+                await Exp.sendMessage(
+                  id,
+                  { image: Buffer.from(f.base64, 'base64'), caption: `📈 Plot Alur Kerja: *${f.filename}*` },
+                  { quoted: cht }
+                );
+              }
+            }
+          } else {
+            runOutput = `Error: ${runResult.error}`;
+          }
+
+          stepHistory += `\nAction: e2b_run\nCode:\n\`\`\`python\n${code}\n\`\`\`\nResult: ${runOutput}\n`;
+          await cht.edit(`🤖 *[ Workflow ]*\nTool Call: \`e2b_run\` Selesai.\nOutput: ${runResult.stdout || runResult.error || 'Sukses'}`, _key, true);
+        }
+      }
+      // Handle 'web_search'
+      else if (config.cmd === 'web_search') {
+        const query = config.cfg?.query;
+        if (!query) {
+          stepHistory += `\nAction: web_search\nResult: Gagal - query tidak disediakan.\n`;
+        } else {
+          await cht.edit(`🤖 *[ Workflow ]*\nTool Call: \`web_search\` - Melakukan pencarian web untuk: *${query}*...`, _key, true);
+          const searchResults = await performWebSearch(query);
+          const formattedResults = searchResults.map((r, i) => `[${i+1}] ${r.title}\nSnippet: ${r.snippet}\nLink: ${r.link}`).join('\n\n');
+          stepHistory += `\nAction: web_search(${query})\nResult:\n${formattedResults || 'Tidak ada hasil.'}\n`;
+          await cht.edit(`🤖 *[ Workflow ]*\nTool Call: \`web_search\` selesai dengan ${searchResults.length} hasil.`, _key, true);
+        }
+      }
+      // Handle 'calc'
+      else if (config.cmd === 'calc') {
+        const expression = config.cfg?.expression;
+        if (!expression) {
+          stepHistory += `\nAction: calc\nResult: Gagal - ekspresi tidak disediakan.\n`;
+        } else {
+          const res = safeEval(expression);
+          stepHistory += `\nAction: calc(${expression})\nResult: ${res}\n`;
+          await cht.edit(`🤖 *[ Workflow ]*\nTool Call: \`calc\` - Menghitung: ${expression} = ${res}`, _key, true);
+        }
+      }
+      // Handle 'write_skill'
+      else if (config.cmd === 'write_skill') {
+        const name = config.cfg?.name?.toLowerCase().replace(/[^a-z0-9_-]/g, '');
+        const content = config.cfg?.content;
+        if (!name || !content) {
+          stepHistory += `\nAction: write_skill\nResult: Gagal - name atau content tidak disediakan.\n`;
+        } else {
+          const filePath = path.join(skillsDir, `${name}.md`);
+          fs.writeFileSync(filePath, content, 'utf8');
+          loadAllSkills();
+          stepHistory += `\nAction: write_skill(${name})\nResult: Sukses membuat/memperbarui skill ${name}.\n`;
+          await cht.edit(`🤖 *[ Workflow ]*\nTool Call: \`write_skill\` untuk skill *${name}*`, _key, true);
+        }
+      }
+      // Handle 'delete_skill'
+      else if (config.cmd === 'delete_skill') {
+        const name = config.cfg?.name?.toLowerCase().replace(/[^a-z0-9_-]/g, '');
+        if (!name) {
+          stepHistory += `\nAction: delete_skill\nResult: Gagal - name tidak disediakan.\n`;
+        } else {
+          const filePath = path.join(skillsDir, `${name}.md`);
+          if (fs.existsSync(filePath)) {
+            fs.unlinkSync(filePath);
+            loadAllSkills();
+            stepHistory += `\nAction: delete_skill(${name})\nResult: Sukses menghapus skill ${name}.\n`;
+            await cht.edit(`🤖 *[ Workflow ]*\nTool Call: \`delete_skill\` untuk skill *${name}*`, _key, true);
+          } else {
+            stepHistory += `\nAction: delete_skill(${name})\nResult: Gagal - skill tidak ditemukan.\n`;
+          }
+        }
+      }
+      // Handle 'list_skills'
+      else if (config.cmd === 'list_skills') {
+        loadAllSkills();
+        const keys = Object.keys(Data.skills);
+        const res = keys.length > 0 ? keys.join(', ') : 'Belum ada skill.';
+        stepHistory += `\nAction: list_skills\nResult: ${res}\n`;
+        await cht.edit(`🤖 *[ Workflow ]*\nTool Call: \`list_skills\` -> ${res}`, _key, true);
+      }
+      // Handle 'workflow_complete'
+      else if (config.cmd === 'workflow_complete') {
+        workflowFinished = true;
+        const finalMsg = config.msg || 'Alur kerja selesai.';
+        await cht.reply(`✅ *[ WORKFLOW SELESAI: ${displayName} ]*\n\n${finalMsg}`);
+        break;
+      }
+      // Handle other/fallback commands if any
+      else {
+        stepHistory += `\nAction: Unknown Command (${config.cmd})\n`;
+      }
+
+    } catch (err) {
+      console.error('[Workflow Loop Error]', err);
+      stepHistory += `\nError pada langkah ${currentIteration}: ${err.message}\n`;
+    }
+
+    currentIteration++;
+    await sleep(2000);
+  }
+
+  if (!workflowFinished) {
+    await cht.reply(`⚠️ *[ Alur Kerja Dihentikan ]*\n\nBatas maksimum langkah (${maxIterations}) telah tercapai sebelum workflow selesai secara otonom.`);
+  }
+}
+
+export default async function on({ Exp, ev, store, cht, ai, is }) {
+  let { sender, id } = cht;
+  const { func } = Exp;
+  const user = sender.split('@')[0];
+  const userVfsDir = path.resolve('toolkit/db/vfs', user);
 
   ev.on(
     {
@@ -210,221 +507,7 @@ export default async function on({ Exp, ev, store, cht, ai, is }) {
         return cht.reply(`❌ Skill *${skillName}* tidak ditemukan! Ketik *.listskills* untuk melihat daftar skill.`);
       }
 
-      const _key = keys[sender];
-      await cht.edit(`🤖 *[ Workflow Engine ]*\n\nMemulai eksekusi skill: *${skill.name}*...\n\n_Membaca instruksi & menyiapkan environment..._`, _key, true);
-
-      // Create user VFS directory if it doesn't exist
-      if (!fs.existsSync(userVfsDir)) {
-        fs.mkdirSync(userVfsDir, { recursive: true });
-      }
-
-      // Initialize history for the agentic loop
-      let stepHistory = `--- WORKFLOW INSTRUCTIONS ---\n${skill.instructions}\n\n--- USER INPUT ---\n${userInput}\n\n`;
-      let currentIteration = 1;
-      const maxIterations = 8;
-      let workflowFinished = false;
-
-      // Define available tools
-      const tools = [
-        {
-          description: "Melihat daftar file di Virtual File System (VFS) user.",
-          output: { cmd: "vfs_ls" }
-        },
-        {
-          description: "Membaca isi file di VFS user.",
-          output: { cmd: "vfs_read", cfg: { filename: "nama_file.txt" } }
-        },
-        {
-          description: "Menulis atau memperbarui file di VFS user.",
-          output: { cmd: "vfs_write", cfg: { filename: "nama_file.txt", content: "isi konten file" } }
-        },
-        {
-          description: "Menjalankan kode Python di secure E2B Sandbox. Secara otomatis mengunggah seluruh isi VFS Anda ke sandbox sebelum eksekusi, serta mengunduh seluruh file baru/grafik yang dibuat kembali ke VFS Anda.",
-          output: { cmd: "e2b_run", cfg: { code: "import pandas as pd\n..." } }
-        },
-        {
-          description: "Melakukan pencarian informasi real-time di web.",
-          output: { cmd: "web_search", cfg: { query: "query pencarian" } }
-        },
-        {
-          description: "Kalkulator untuk menghitung ekspresi matematika secara aman.",
-          output: { cmd: "calc", cfg: { expression: "2 * (5 + 3)" } }
-        },
-        {
-          description: "Menyelesaikan workflow dan memberikan hasil akhir/rangkuman lengkap kepada user.",
-          output: { cmd: "workflow_complete", msg: "Rangkuman lengkap dan hasil akhir workflow Anda." }
-        }
-      ];
-
-      const systemProfile = `Anda adalah asisten AI otonom yang sangat terampil bernama Bella.
-Tugas Anda adalah memandu dan menyelesaikan workflow instruksi skill berikut menggunakan tools yang tersedia.
-Ikuti instruksi langkah-demi-langkah dengan sangat teliti.
-
-Anda dapat menggunakan tools seperti VFS, E2B Sandbox (untuk menjalankan Python), Web Search, dan Kalkulator.
-Gunakan tools tersebut secara berurutan dan otonom. Jangan menjelaskan tool call kepada user, cukup panggil tool-nya.
-Setelah selesai melaksanakan seluruh instruksi atau mencapai tujuan, panggil tool 'workflow_complete' dengan rangkuman hasil.
-
-Informasi User ID Anda: ${user}
-Lakukan langkah demi langkah.`;
-
-      while (currentIteration <= maxIterations && !workflowFinished) {
-        await cht.edit(`🤖 *[ Workflow: ${skill.name} ]*\n\n[Langkah ${currentIteration}/${maxIterations}] AI sedang berpikir dan menganalisis langkah selanjutnya...`, _key, true);
-
-        // Fetch user VFS file list to give context to the AI
-        const vfsFiles = fs.existsSync(userVfsDir) ? fs.readdirSync(userVfsDir) : [];
-        const vfsContext = vfsFiles.length > 0 ? `File saat ini di VFS: ${vfsFiles.join(', ')}` : 'VFS saat ini kosong.';
-
-        const promptText = `Status Iterasi Saat Ini: ${currentIteration}
-${vfsContext}
-
-Riwayat Langkah Sebelumnya & Hasil Eksekusi:
-${stepHistory}
-
-Silakan analisis instruksi dan putuskan tindakan berikutnya. Panggil tool yang sesuai. Jika sudah selesai, panggil 'workflow_complete'.`;
-
-        try {
-          const aiResponse = await runAiReasoner({
-            text: promptText,
-            id: sender,
-            fullainame: botfullname,
-            nickainame: botnickname,
-            senderName: cht.pushName,
-            ownerName: ownername,
-            date: func.newDate(),
-            role: 'Asisten AI Alur Kerja',
-            msgtype: 'text',
-            custom_profile: systemProfile,
-            commands: tools
-          });
-
-          const config = aiResponse?.data || {};
-          console.log(`[Workflow Agent Step ${currentIteration}]`, config);
-
-          if (!config.cmd) {
-            // Default text output from AI, record it and ask again if not finished
-            const msg = config.msg || aiResponse?.response || 'Memikirkan langkah berikutnya...';
-            stepHistory += `\nThought: ${msg}\n`;
-            currentIteration++;
-            continue;
-          }
-
-          // Handle 'vfs_ls'
-          if (config.cmd === 'vfs_ls') {
-            const files = fs.existsSync(userVfsDir) ? fs.readdirSync(userVfsDir) : [];
-            const result = files.length > 0 ? `Daftar file: ${files.join(', ')}` : 'VFS kosong.';
-            stepHistory += `\nAction: vfs_ls\nResult: ${result}\n`;
-            await cht.edit(`🤖 *[ Workflow ]*\nTool Call: \`vfs_ls\`\nResult: ${result}`, _key, true);
-          }
-          // Handle 'vfs_read'
-          else if (config.cmd === 'vfs_read') {
-            const filename = config.cfg?.filename;
-            if (!filename) {
-              stepHistory += `\nAction: vfs_read\nResult: Gagal - filename tidak disediakan.\n`;
-            } else {
-              const safeName = path.basename(filename);
-              const filePath = path.join(userVfsDir, safeName);
-              if (fs.existsSync(filePath)) {
-                const content = fs.readFileSync(filePath, 'utf8');
-                stepHistory += `\nAction: vfs_read(${safeName})\nResult: \`\`\`\n${content}\n\`\`\`\n`;
-                await cht.edit(`🤖 *[ Workflow ]*\nTool Call: \`vfs_read\` untuk file *${safeName}*`, _key, true);
-              } else {
-                stepHistory += `\nAction: vfs_read(${safeName})\nResult: Gagal - file tidak ditemukan.\n`;
-              }
-            }
-          }
-          // Handle 'vfs_write'
-          else if (config.cmd === 'vfs_write') {
-            const filename = config.cfg?.filename;
-            const content = config.cfg?.content;
-            if (!filename || !content) {
-              stepHistory += `\nAction: vfs_write\nResult: Gagal - filename atau content tidak disediakan.\n`;
-            } else {
-              const safeName = path.basename(filename);
-              const filePath = path.join(userVfsDir, safeName);
-              fs.writeFileSync(filePath, content, 'utf8');
-              stepHistory += `\nAction: vfs_write(${safeName})\nResult: Sukses menulis file.\n`;
-              await cht.edit(`🤖 *[ Workflow ]*\nTool Call: \`vfs_write\` menulis ke file *${safeName}*`, _key, true);
-            }
-          }
-          // Handle 'e2b_run'
-          else if (config.cmd === 'e2b_run') {
-            const code = config.cfg?.code;
-            if (!code) {
-              stepHistory += `\nAction: e2b_run\nResult: Gagal - code tidak disediakan.\n`;
-            } else {
-              await cht.edit(`🤖 *[ Workflow ]*\nTool Call: \`e2b_run\` - Menjalankan kode Python di E2B Sandbox...`, _key, true);
-              const runResult = await runCodeInSandbox({ code, language: 'python', userId: user });
-
-              let runOutput = '';
-              if (runResult.success) {
-                runOutput = `stdout:\n${runResult.stdout}\nstderr:\n${runResult.stderr}`;
-                if (runResult.files && runResult.files.length > 0) {
-                  runOutput += `\nFile baru dihasilkan: ${runResult.files.map(f => f.filename).join(', ')}`;
-                  // Instantly send generated plots/images to the user!
-                  for (const f of runResult.files) {
-                    await Exp.sendMessage(
-                      id,
-                      { image: Buffer.from(f.base64, 'base64'), caption: `📈 Plot Alur Kerja: *${f.filename}*` },
-                      { quoted: cht }
-                    );
-                  }
-                }
-              } else {
-                runOutput = `Error: ${runResult.error}`;
-              }
-
-              stepHistory += `\nAction: e2b_run\nCode:\n\`\`\`python\n${code}\n\`\`\`\nResult: ${runOutput}\n`;
-              await cht.edit(`🤖 *[ Workflow ]*\nTool Call: \`e2b_run\` Selesai.\nOutput: ${runResult.stdout || runResult.error || 'Sukses'}`, _key, true);
-            }
-          }
-          // Handle 'web_search'
-          else if (config.cmd === 'web_search') {
-            const query = config.cfg?.query;
-            if (!query) {
-              stepHistory += `\nAction: web_search\nResult: Gagal - query tidak disediakan.\n`;
-            } else {
-              await cht.edit(`🤖 *[ Workflow ]*\nTool Call: \`web_search\` - Melakukan pencarian web untuk: *${query}*...`, _key, true);
-              const searchResults = await performWebSearch(query);
-              const formattedResults = searchResults.map((r, i) => `[${i+1}] ${r.title}\nSnippet: ${r.snippet}\nLink: ${r.link}`).join('\n\n');
-              stepHistory += `\nAction: web_search(${query})\nResult:\n${formattedResults || 'Tidak ada hasil.'}\n`;
-              await cht.edit(`🤖 *[ Workflow ]*\nTool Call: \`web_search\` selesai dengan ${searchResults.length} hasil.`, _key, true);
-            }
-          }
-          // Handle 'calc'
-          else if (config.cmd === 'calc') {
-            const expression = config.cfg?.expression;
-            if (!expression) {
-              stepHistory += `\nAction: calc\nResult: Gagal - ekspresi tidak disediakan.\n`;
-            } else {
-              const res = safeEval(expression);
-              stepHistory += `\nAction: calc(${expression})\nResult: ${res}\n`;
-              await cht.edit(`🤖 *[ Workflow ]*\nTool Call: \`calc\` - Menghitung: ${expression} = ${res}`, _key, true);
-            }
-          }
-          // Handle 'workflow_complete'
-          else if (config.cmd === 'workflow_complete') {
-            workflowFinished = true;
-            const finalMsg = config.msg || 'Alur kerja selesai.';
-            await cht.reply(`✅ *[ WORKFLOW SELESAI: ${skill.name} ]*\n\n${finalMsg}`);
-            break;
-          }
-          // Handle other/fallback commands if any
-          else {
-            stepHistory += `\nAction: Unknown Command (${config.cmd})\n`;
-          }
-
-        } catch (err) {
-          console.error('[Workflow Loop Error]', err);
-          stepHistory += `\nError pada langkah ${currentIteration}: ${err.message}\n`;
-        }
-
-        currentIteration++;
-        await sleep(2000);
-      }
-
-      if (!workflowFinished) {
-        await cht.reply(`⚠️ *[ Alur Kerja Dihentikan ]*\n\nBatas maksimum langkah (${maxIterations}) telah tercapai sebelum workflow selesai secara otonom.`);
-      }
+      await runWorkflowAgent({ Exp, cht, skillName, userInput, ev });
     }
   );
 }
