@@ -23,6 +23,7 @@
   },
   "homepage": "https://github.com/Rifza123/Experimental-Bell#readme",
   "dependencies": {
+    "@e2b/code-interpreter": "^2.6.1",
     "@napi-rs/canvas": "^0.1.85",
     "@whiskeysockets/baileys": "github:Rifza123/baileys",
     "axios": "^1.7.8",
